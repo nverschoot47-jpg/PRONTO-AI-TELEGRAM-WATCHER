@@ -11,11 +11,17 @@
 // completely separate Railway service that just reads their public
 // API, the same way your dashboard already does.
 //
-// ── Required env vars (set in THIS Railway service only) ───────────
-//   TELEGRAM_BOT_TOKEN   = 8769112532:AAG31SZrYQfGOUCH2pTwtXsgSA6V8L9mp1c
-//   TELEGRAM_CHAT_ID     = 7667906358
-//   ACCOUNTS             = JSON array, see below
-//   POLL_INTERVAL_MS     = optional, default 10000 (10s)
+// ── Setup (one-time) ────────────────────────────────────────────────
+// 1. Bot already created: @Pronto_ai_alerts_bot
+// 2. Set these env vars in THIS Railway service:
+//      TELEGRAM_BOT_TOKEN = 8769112532:AAG31SZrYQfGOUCH2pTwtXsgSA6V8L9mp1c
+//      TELEGRAM_CHAT_ID   = -5519086731   (the "trading groupchat" group —
+//                                          note the minus sign, group IDs
+//                                          are negative. Add the bot to the
+//                                          group and add/remove people there
+//                                          to control who sees alerts.)
+//      ACCOUNTS            = JSON array, see below
+//      POLL_INTERVAL_MS    = optional, default 10000 (10s)
 //
 // Example ACCOUNTS value (set as ONE single-line env var in Railway):
 //   [{"label":"FTMO","url":"https://your-ftmo-service.up.railway.app"},
