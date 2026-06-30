@@ -1,0 +1,13 @@
+{
+  "name": "pronto-ai-telegram-watcher",
+  "version": "1.0.0",
+  "description": "Polls all PRONTO-AI broker services and sends Telegram alerts on new trades",
+  "main": "telegram-watcher.js",
+  "scripts": {
+    "start": "node telegram-watcher.js"
+  },
+  "engines": {
+    "node": ">=18.13.0"
+  },
+  "private": true
+}
