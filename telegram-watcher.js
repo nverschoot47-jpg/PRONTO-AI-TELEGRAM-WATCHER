@@ -41,7 +41,15 @@ const POLL_INTERVAL_MS   = parseInt(process.env.POLL_INTERVAL_MS) || 10000;
 
 let ACCOUNTS = [];
 try {
-  ACCOUNTS = JSON.parse(process.env.ACCOUNTS || "[]");
+  const parsed = JSON.parse(process.env.ACCOUNTS || "[]");
+  if (Array.isArray(parsed)) {
+    ACCOUNTS = parsed;
+  } else {
+    console.error(
+      `[Watcher] ACCOUNTS env var must be a JSON ARRAY (e.g. [{"label":"FTMO","url":"..."}]), ` +
+        `but got a ${typeof parsed}. Wrap it in square brackets. Falling back to empty list.`
+    );
+  }
 } catch (e) {
   console.error(`[Watcher] Failed to parse ACCOUNTS env var as JSON: ${e.message}`);
 }
