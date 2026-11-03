@@ -1,0 +1,403 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Aurocks_AIF — Sessions + PD Morning Channel + Break Signals + VWAP + % SL
+
+//@version=6
+
+indicator("Data collector FTMO DEMO", overlay = true, max_boxes_count = 100, max_lines_count = 200, max_labels_count = 500, max_bars_back = 5000)
+
+// ═══════════════════════════════════════════════
+// SESSION BACKGROUND SETTINGS
+// ═══════════════════════════════════════════════
+bgColor     = input.bool(false, "Activate High/Low View")
+
+LondonColor = color.new(color.gray, 75)
+NYColor     = color.new(color.gray, 88)
+AsiaColor   = color.new(color.yellow, 90)
+SydneyColor = color.new(color.blue, 90)
+
+res    = input.timeframe("D", "Resolution", options = ["D", "W", "M"])
+london = input.session("0200-0330:1234567", "London Session")
+ny     = input.session("0900-1359:1234567", "New York Session")
+tokyo  = input.session("2000-0400:1234567", "Tokyo Session")
+sydney = input.session("1700-0200:1234567", "Sydney Session")
+
+is_newbar(sess) =>
+    t = time(res, sess, "America/New_York")
+    na(t[1]) and not na(t) or t[1] < t
+
+is_session(sess) =>
+    not na(time(timeframe.period, sess, "America/New_York"))
+
+London        = input.bool(true, "London Session")
+londonNewbar  = is_newbar(london)
+londonSession = is_session(london)
+var float londonLow  = na
+var float londonHigh = na
+londonLow  := londonSession ? (londonNewbar ? low  : math.min(londonLow[1],  low))  : londonLow
+londonHigh := londonSession ? (londonNewbar ? high : math.max(londonHigh[1], high)) : londonHigh
+plotLL = plot(londonLow,  color = color.new(#000000, 100))
+plotLH = plot(londonHigh, color = color.new(#000000, 100))
+fill(plotLL, plotLH, color = londonSession and London and bgColor ? LondonColor : na)
+bgcolor(londonSession and London and not bgColor ? LondonColor : na)
+
+NY        = input.bool(true, "New York Session")
+nyNewbar  = is_newbar(ny)
+nySession = is_session(ny)
+var float nyLow  = na
+var float nyHigh = na
+nyLow  := nySession ? (nyNewbar ? low  : math.min(nyLow[1],  low))  : nyLow
+nyHigh := nySession ? (nyNewbar ? high : math.max(nyHigh[1], high)) : nyHigh
+plotNYL = plot(nyLow,  color = color.new(#000000, 100))
+plotNYH = plot(nyHigh, color = color.new(#000000, 100))
+fill(plotNYL, plotNYH, color = nySession and NY and bgColor ? NYColor : na)
+bgcolor(nySession and NY and not bgColor ? NYColor : na)
+
+Tokyo        = input.bool(true, "Tokyo Session")
+tokyoNewbar  = is_newbar(tokyo)
+tokyoSession = is_session(tokyo)
+var float tokyoLow  = na
+var float tokyoHigh = na
+tokyoLow  := tokyoSession ? (tokyoNewbar ? low  : math.min(tokyoLow[1],  low))  : tokyoLow
+tokyoHigh := tokyoSession ? (tokyoNewbar ? high : math.max(tokyoHigh[1], high)) : tokyoHigh
+plotTL = plot(tokyoLow,  color = color.new(#000000, 100))
+plotTH = plot(tokyoHigh, color = color.new(#000000, 100))
+fill(plotTL, plotTH, color = tokyoSession and Tokyo and bgColor ? AsiaColor : na)
+bgcolor(tokyoSession and Tokyo and not bgColor ? AsiaColor : na)
+
+Sydney        = input.bool(false, "Sydney Session")
+sydneyNewbar  = is_newbar(sydney)
+sydneySession = is_session(sydney)
+var float sydneyLow  = na
+var float sydneyHigh = na
+sydneyLow  := sydneySession ? (sydneyNewbar ? low  : math.min(sydneyLow[1],  low))  : sydneyLow
+sydneyHigh := sydneySession ? (sydneyNewbar ? high : math.max(sydneyHigh[1], high)) : sydneyHigh
+plotSL = plot(sydneyLow,  color = color.new(#000000, 100))
+plotSH = plot(sydneyHigh, color = color.new(#000000, 100))
+fill(plotSL, plotSH, color = sydneySession and Sydney and bgColor ? SydneyColor : na)
+bgcolor(sydneySession and Sydney and not bgColor ? SydneyColor : na)
+
+// ═══════════════════════════════════════════════
+// MORNING CHANNEL — SESSION DETECTION
+// ═══════════════════════════════════════════════
+sessionInput    = input.session("0800-0930", "Morning Session")
+sessionTimezone = input.string("GMT+1", "Session Timezone")
+inMorning  = not na(time(timeframe.period, sessionInput, sessionTimezone))
+sessionEnd = not inMorning and inMorning[1]
+newDay     = ta.change(time("D")) != 0
+
+// ── Day high/low ──────────────────────────────────────────────────────────
+var float dayHigh    = na
+var float dayLow     = na
+var int   dayHighBar = na
+var int   dayLowBar  = na
+var chart.point prevHighPoint = na
+var chart.point prevLowPoint  = na
+
+if newDay
+    if not na(dayHighBar)
+        prevHighPoint := chart.point.from_index(dayHighBar, dayHigh)
+        prevLowPoint  := chart.point.from_index(dayLowBar,  dayLow)
+    dayHigh    := high
+    dayLow     := low
+    dayHighBar := bar_index
+    dayLowBar  := bar_index
+else
+    if na(dayHigh) or high > dayHigh
+        dayHigh    := high
+        dayHighBar := bar_index
+    if na(dayLow) or low < dayLow
+        dayLow    := low
+        dayLowBar := bar_index
+
+// ── Morning session high/low ──────────────────────────────────────────────
+var float sessionHigh    = na
+var float sessionLow     = na
+var int   sessionHighBar = na
+var int   sessionLowBar  = na
+var chart.point sessionHighPoint = na
+var chart.point sessionLowPoint  = na
+
+if newDay
+    sessionHigh      := na
+    sessionLow       := na
+    sessionHighBar   := na
+    sessionLowBar    := na
+    sessionHighPoint := na
+    sessionLowPoint  := na
+
+if inMorning
+    if na(sessionHigh) or high > sessionHigh
+        sessionHigh    := high
+        sessionHighBar := bar_index
+    if na(sessionLow) or low < sessionLow
+        sessionLow    := low
+        sessionLowBar := bar_index
+
+if sessionEnd
+    if not na(sessionHighBar)
+        sessionHighPoint := chart.point.from_index(sessionHighBar, sessionHigh)
+    if not na(sessionLowBar)
+        sessionLowPoint  := chart.point.from_index(sessionLowBar, sessionLow)
+
+// ── ACTIVE CHANNEL LEVELS (overleven middernacht) ─────────────────────────
+// Het KANAAL waarop signalen vuren blijft na middernacht gewoon staan: het wordt
+// pas herbouwd zodra de nieuwe ochtendrange klaar is (09:30). Maar sessionHigh /
+// sessionLow werden hierboven bij `newDay` gewist. Gevolg: een breuk om 02:25
+// brak het kanaal van GISTEREN, maar logde "session_high": NaN.
+//
+// De webhook moet het kanaal beschrijven dat hij ECHT gebroken heeft. Deze twee
+// waarden worden gezet zodra het kanaal definitief is, en nooit gewist — dus ze
+// horen altijd bij het kanaal dat op dat moment live is.
+var float activeChanHigh = na
+var float activeChanLow  = na
+
+if sessionEnd
+    if not na(sessionHigh)
+        activeChanHigh := sessionHigh
+    if not na(sessionLow)
+        activeChanLow  := sessionLow
+
+// ═══════════════════════════════════════════════
+// VWAP — Daily anchored (resets each day)
+// Best for 5min intraday trading
+// ═══════════════════════════════════════════════
+[vwapValue, vwapUpper1, vwapLower1] = ta.vwap(hlc3, newDay, 1)
+
+plot(vwapValue,  title = "VWAP",        color = color.new(color.purple, 0),  linewidth = 2)
+plot(vwapUpper1, title = "VWAP +1 StD", color = color.new(color.purple, 60), linewidth = 1)
+plot(vwapLower1, title = "VWAP -1 StD", color = color.new(color.purple, 60), linewidth = 1)
+
+// ═══════════════════════════════════════════════
+// CHANNEL LINES
+// ═══════════════════════════════════════════════
+var line lowChannel                = na
+var line highChannel               = na
+var line fib50Line_lowchannel      = na
+var line fib50Line_highchannel     = na
+var line lowChannel_parallel_line  = na
+var line highChannel_parallel_line = na
+
+var line cs_lc_trackLine  = na
+var line cs_hc_trackLine  = na
+var line cs_lcp_trackLine = na
+var line cs_hcp_trackLine = na
+var int  cs_channelStartBar = na
+
+if sessionEnd
+    cs_lc_trackLine  := na
+    cs_hc_trackLine  := na
+    cs_lcp_trackLine := na
+    cs_hcp_trackLine := na
+    cs_channelStartBar := na
+
+if sessionEnd and not na(prevLowPoint) and not na(sessionLowPoint)
+    line.delete(lowChannel)
+    line.delete(highChannel)
+    line.delete(fib50Line_highchannel)
+    line.delete(fib50Line_lowchannel)
+    line.delete(lowChannel_parallel_line)
+    line.delete(highChannel_parallel_line)
+
+    _lcDx  = float(sessionLowPoint.index  - prevLowPoint.index)
+    _lcDy  = sessionLowPoint.price  - prevLowPoint.price
+    _hcDx  = float(sessionHighPoint.index - prevHighPoint.index)
+    _hcDy  = sessionHighPoint.price - prevHighPoint.price
+    _lc_offset = prevHighPoint.price - prevLowPoint.price
+
+    lowChannel               := line.new(prevLowPoint, sessionLowPoint, extend = extend.right, color = color.black, width = 2)
+    lowChannel_parallel_line := line.new(prevHighPoint.index, prevHighPoint.price, prevHighPoint.index + int(_lcDx), prevHighPoint.price + _lcDy, extend = extend.right, color = color.black, width = 2)
+    fib50Line_lowchannel     := line.new(prevLowPoint.index, prevLowPoint.price + _lc_offset / 2.0, sessionLowPoint.index, sessionLowPoint.price + _lc_offset / 2.0, extend = extend.right, color = color.black, style = line.style_dotted, width = 2)
+
+    highChannel               := line.new(prevHighPoint, sessionHighPoint, extend = extend.right, color = color.black, width = 2)
+    highChannel_parallel_line := line.new(prevLowPoint.index, prevLowPoint.price, prevLowPoint.index + int(_hcDx), prevLowPoint.price + _hcDy, extend = extend.right, color = color.black, width = 2)
+    _hc_offset = prevHighPoint.price - prevLowPoint.price
+    fib50Line_highchannel     := line.new(prevHighPoint.index, prevHighPoint.price - _hc_offset / 2.0, sessionHighPoint.index, sessionHighPoint.price - _hc_offset / 2.0, extend = extend.right, color = color.black, style = line.style_dotted, width = 2)
+
+    cs_lc_trackLine    := lowChannel
+    cs_hc_trackLine    := highChannel
+    cs_lcp_trackLine   := lowChannel_parallel_line
+    cs_hcp_trackLine   := highChannel_parallel_line
+    cs_channelStartBar := math.min(prevLowPoint.index, prevHighPoint.index)
+
+// ═══════════════════════════════════════════════
+// BREAK SIGNALS  (detection + counters kept — on-chart ▲/▼ labels removed)
+// ═══════════════════════════════════════════════
+f_lineY(_ln, _bi) =>
+    float _result = na
+    if not na(_ln)
+        int   _x1 = line.get_x1(_ln)
+        float _y1 = line.get_y1(_ln)
+        int   _x2 = line.get_x2(_ln)
+        float _y2 = line.get_y2(_ln)
+        int   _dx = _x2 - _x1
+        _result  := _dx != 0 ? _y1 + (_y2 - _y1) / _dx * (_bi - _x1) : _y1
+    _result
+
+var int cs_lcAbove  = 0
+var int cs_hcAbove  = 0
+var int cs_lcpAbove = 0
+var int cs_hcpAbove = 0
+var int day_bullBreaks = 0
+var int day_bearBreaks = 0
+var label[] cs_breakLabels = array.new<label>()
+
+var bool cs_bullBreakThisBar = false
+var bool cs_bearBreakThisBar = false
+
+if sessionEnd
+    cs_lcAbove  := 0
+    cs_hcAbove  := 0
+    cs_lcpAbove := 0
+    cs_hcpAbove := 0
+    day_bullBreaks := 0
+    day_bearBreaks := 0
+    for _lbl in cs_breakLabels
+        label.delete(_lbl)
+    cs_breakLabels.clear()
+
+cs_bullBreakThisBar := false
+cs_bearBreakThisBar := false
+
+if barstate.isconfirmed
+    if not na(cs_lc_trackLine) and not na(cs_channelStartBar) and bar_index >= cs_channelStartBar
+        _lcY = f_lineY(cs_lc_trackLine, bar_index)
+        if not na(_lcY)
+            _lcIsAbove = close > _lcY
+            if cs_lcAbove != 0
+                if _lcIsAbove and cs_lcAbove == -1
+                    day_bullBreaks += 1
+                    cs_bullBreakThisBar := true
+                else if not _lcIsAbove and cs_lcAbove == 1
+                    day_bearBreaks += 1
+                    cs_bearBreakThisBar := true
+            cs_lcAbove := _lcIsAbove ? 1 : -1
+
+    if not na(cs_hc_trackLine) and not na(cs_channelStartBar) and bar_index >= cs_channelStartBar
+        _hcY = f_lineY(cs_hc_trackLine, bar_index)
+        if not na(_hcY)
+            _hcIsAbove = close > _hcY
+            if cs_hcAbove != 0
+                if _hcIsAbove and cs_hcAbove == -1
+                    day_bullBreaks += 1
+                    cs_bullBreakThisBar := true
+                else if not _hcIsAbove and cs_hcAbove == 1
+                    day_bearBreaks += 1
+                    cs_bearBreakThisBar := true
+            cs_hcAbove := _hcIsAbove ? 1 : -1
+
+    if not na(cs_lcp_trackLine) and not na(cs_channelStartBar) and bar_index >= cs_channelStartBar
+        _lcpY = f_lineY(cs_lcp_trackLine, bar_index)
+        if not na(_lcpY)
+            _lcpIsAbove = close > _lcpY
+            if cs_lcpAbove != 0
+                if _lcpIsAbove and cs_lcpAbove == -1
+                    day_bullBreaks += 1
+                    cs_bullBreakThisBar := true
+                else if not _lcpIsAbove and cs_lcpAbove == 1
+                    day_bearBreaks += 1
+                    cs_bearBreakThisBar := true
+            cs_lcpAbove := _lcpIsAbove ? 1 : -1
+
+    if not na(cs_hcp_trackLine) and not na(cs_channelStartBar) and bar_index >= cs_channelStartBar
+        _hcpY = f_lineY(cs_hcp_trackLine, bar_index)
+        if not na(_hcpY)
+            _hcpIsAbove = close > _hcpY
+            if cs_hcpAbove != 0
+                if _hcpIsAbove and cs_hcpAbove == -1
+                    day_bullBreaks += 1
+                    cs_bullBreakThisBar := true
+                else if not _hcpIsAbove and cs_hcpAbove == 1
+                    day_bearBreaks += 1
+                    cs_bearBreakThisBar := true
+            cs_hcpAbove := _hcpIsAbove ? 1 : -1
+
+    if cs_bullBreakThisBar and cs_breakLabels.size() < 490
+        cs_breakLabels.push(label.new(bar_index, low, '▲' + str.tostring(day_bullBreaks),
+             xloc = xloc.bar_index, yloc = yloc.belowbar,
+             style = label.style_label_up, color = #1b5e20,
+             textcolor = color.white, size = size.small))
+    if cs_bearBreakThisBar and cs_breakLabels.size() < 490
+        cs_breakLabels.push(label.new(bar_index, high, '▼' + str.tostring(day_bearBreaks),
+             xloc = xloc.bar_index, yloc = yloc.abovebar,
+             style = label.style_label_down, color = #b71c1c,
+             textcolor = color.white, size = size.small))
+
+// ═══════════════════════════════════════════════
+// STOP LOSS SETTINGS
+// SL is anchored to the break candle (low for buys, high for sells) and then
+// pushed sl_pct further as a buffer. The absolute distance rides in sl_points,
+// so MT5 places the stop as: fill − sl_points (buy) / fill + sl_points (sell).
+// ═══════════════════════════════════════════════
+sl_pct = input.float(0.20, "SL buffer % beyond break candle", minval = 0.01, maxval = 2.0, step = 0.01, group = "Stop Loss") / 100.0
+
+// ═══════════════════════════════════════════════
+// ALERT CONDITIONS — WEBHOOK READY
+//
+// Signals now fire directly on the channel break (retracement filter removed).
+//
+// SL logic:
+//   sl        = break candle low (buy) / high (sell) ± sl_pct buffer — raw price, logging only
+//   sl_pct    = buffer % applied beyond the candle extreme
+//   sl_points = full entry-to-SL distance in price units.
+//               MT5 should place the stop with THIS: fill − sl_points (buy) / fill + sl_points (sell)
+//
+// VWAP: daily anchored, resets at midnight — correct for 5min charts
+//   vwap        = mid line
+//   vwap_upper  = +1 std dev band (resistance/extended)
+//   vwap_lower  = -1 std dev band (support/oversold)
+//
+// Webhook URL: https://automatedcfdtrading-production.up.railway.app/webhook?secret=<YOUR_SECRET>
+// Risk: 0.1% van €50.000 = €50 per trade
+// ═══════════════════════════════════════════════
+bull_alert = cs_bullBreakThisBar
+bear_alert = cs_bearBreakThisBar
+
+// SL = the break candle's extreme, pushed sl_pct further as a buffer
+//   buy  -> below the break candle LOW
+//   sell -> above the break candle HIGH
+bull_sl_price = low  * (1.0 - sl_pct)
+bear_sl_price = high * (1.0 + sl_pct)
+
+// Decimal precision: 5 for forex (0.00001), 2 for stocks/indices/futures
+_dec = syminfo.mintick >= 0.01 ? 2 : 5
+
+// sl_points: full entry-to-SL distance in the instrument's own price units
+// (entry − candle-based stop). This is the number MT5 should use to place the stop.
+bull_sl_points = math.round(close - bull_sl_price, _dec)
+bear_sl_points = math.round(bear_sl_price - close, _dec)
+
+if bull_alert
+    alert(
+         '{"action":"buy"'                                                          +
+         ',"symbol":"'        + syminfo.ticker                              + '"'  +
+         ',"entry":'          + str.tostring(math.round(close,        _dec))       +
+         ',"sl":'             + str.tostring(math.round(bull_sl_price,_dec))       +
+         ',"sl_pct":'         + str.tostring(sl_pct)                               +
+         ',"sl_points":'      + str.tostring(bull_sl_points)                       +
+         ',"vwap":'           + str.tostring(math.round(vwapValue,    _dec))       +
+         ',"vwap_upper":'     + str.tostring(math.round(vwapUpper1,   _dec))       +
+         ',"vwap_lower":'     + str.tostring(math.round(vwapLower1,   _dec))       +
+         ',"session_high":'   + str.tostring(math.round(activeChanHigh, _dec))     +
+         ',"session_low":'    + str.tostring(math.round(activeChanLow,  _dec))     +
+         ',"day_high":'       + str.tostring(math.round(dayHigh,      _dec))       +
+         ',"day_low":'        + str.tostring(math.round(dayLow,       _dec))       +
+         '}',
+         alert.freq_once_per_bar_close)
+
+if bear_alert
+    alert(
+         '{"action":"sell"'                                                         +
+         ',"symbol":"'        + syminfo.ticker                              + '"'  +
+         ',"entry":'          + str.tostring(math.round(close,        _dec))       +
+         ',"sl":'             + str.tostring(math.round(bear_sl_price,_dec))       +
+         ',"sl_pct":'         + str.tostring(sl_pct)                               +
+         ',"sl_points":'      + str.tostring(bear_sl_points)                       +
+         ',"vwap":'           + str.tostring(math.round(vwapValue,    _dec))       +
+         ',"vwap_upper":'     + str.tostring(math.round(vwapUpper1,   _dec))       +
+         ',"vwap_lower":'     + str.tostring(math.round(vwapLower1,   _dec))       +
+         ',"session_high":'   + str.tostring(math.round(activeChanHigh, _dec))     +
+         ',"session_low":'    + str.tostring(math.round(activeChanLow,  _dec))     +
+         ',"day_high":'       + str.tostring(math.round(dayHigh,      _dec))       +
+         ',"day_low":'        + str.tostring(math.round(dayLow,       _dec))       +
+         '}',
+         alert.freq_once_per_bar_close)
