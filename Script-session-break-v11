@@ -1,0 +1,500 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © eltrudi
+
+//@version=6
+// ============================================================
+// NICK SESSION BOX v10 - VWAP ONLY + SL/RR SCANNER
+// Belgium time. 5min chart.
+// Asia 03:00-09:00 | London 09:30-15:00 | America 15:30-00:00
+//
+// SETUPS: 1 BO Long | 2 REV Short | 3 BO Short | 4 REV Long
+// NO REGIME. Only VWAP side: with / agst (against) / all
+//   with = long above VWAP or short below VWAP
+//   agst = long below VWAP or short above VWAP
+//
+// SCANNER (toggle in settings, group "Scanner"):
+//   Every signal of every setup is tracked with a whole grid of
+//   SL multipliers x RR values (virtual trades, no extra orders).
+//   For each setup x VWAP side the table shows the BEST SL x / RR.
+//
+// MODE "Auto best (positive only)":
+//   a signal is taken only if the best SL/RR combo of its setup + VWAP side
+//   has Tot R above your minimum and enough resolved trades. The trade
+//   then uses that best SL multiplier and RR.
+// MODE "Manual SL/RR": fixed multipliers from the inputs, all 4 setups.
+//
+// SL: base distance x multiplier. No time exit. SL and TP in one candle = loss.
+//   breakout base  = entry -> opposite box side
+//   reversal base  = signal candle range/body (multiplier never below 2)
+// ============================================================
+indicator("NICK Session Box v11 - CHANGES OVERTIME", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+// ---------------- INPUTS ----------------
+bool showScanner  = input.bool(true, "SCANNER ON / OFF (edge table, bottom right)", group = "Scanner")
+bool showCfgTbl   = input.bool(true, "Best SL x / RR table (top middle)", group = "Scanner")
+string gridSetup  = input.string("Off", "Grid view: setup (full SL x RR heatmap)", options = ["Off", "1 BO Long", "2 REV Short", "3 BO Short", "4 REV Long"], group = "Scanner")
+string gridSide   = input.string("with", "Grid view: VWAP side", options = ["all", "with", "agst"], group = "Scanner")
+string rankBy     = input.string("Tot R", "Best combo is ranked by", options = ["Tot R", "Avg R"], group = "Scanner")
+int memK          = input.int(40, "Scanner memory: only the last X resolved trades per combo (0 = all history)", minval = 0, maxval = 100, group = "Scanner")
+string slBOtxt    = input.string("0.125,0.25,0.5,1,2", "Scan: breakout SL multipliers (max 8)", group = "Scanner")
+string slREVtxt   = input.string("2,2.5,3,4,5", "Scan: reversal SL multipliers (min 2, max 8)", group = "Scanner")
+string rrListTxt  = input.string("2,3,5,7,8,10,12", "Scan: RR values (max 8)", group = "Scanner")
+
+string modeSel    = input.string("Auto best (positive only)", "Strategy mode", options = ["Auto best (positive only)", "Manual SL/RR (all 4)"], group = "Strategy")
+float posMinTot   = input.float(0.0, "Auto: best combo Tot R must be above", step = 0.5, group = "Strategy")
+int posMinN       = input.int(15, "Auto: min resolved trades in a combo", minval = 1, group = "Strategy")
+float mBoSL       = input.float(0.5, "Manual: breakout SL multiplier", minval = 0.01, step = 0.05, group = "Strategy")
+float mBoRR       = input.float(5.0, "Manual: breakout RR", minval = 0.5, step = 0.5, group = "Strategy")
+float mRevSL      = input.float(2.5, "Manual: reversal SL multiplier (min 2)", minval = 2.0, step = 0.25, group = "Strategy")
+float mRevRR      = input.float(5.0, "Manual: reversal RR", minval = 0.5, step = 0.5, group = "Strategy")
+
+int windowMin     = input.int(1000, "Window for NEW signals after session (min)", minval = 1, group = "Setup")
+bool oneTrade     = input.bool(true, "One trade at a time per setup (skip while an earlier one still runs)", group = "Setup")
+bool wickSweep    = input.bool(false, "Reversal: a wick outside the box also counts (else prior close outside)", group = "Setup")
+string candleDist = input.string("High-Low range", "Reversal SL: candle distance", options = ["High-Low range", "Body"], group = "Setup")
+float minStop     = input.float(0.0, "Min stop distance in price units (spread guard, 0 = off)", minval = 0.0, group = "Setup")
+
+bool showLines    = input.bool(true, "Show entry / SL / TP lines (short, subtle)", group = "Visual")
+int lineBars      = input.int(5, "Line length in candles", minval = 1, maxval = 50, group = "Visual")
+bool showLineTxt  = input.bool(true, "Tiny price text at the end of the lines", group = "Visual")
+bool showTag      = input.bool(true, "Tag next to the arrow: setup, SL multiplier, RR, VWAP side", group = "Visual")
+
+string vwType     = input.string("Normal (chart daily)", "VWAP type", options = ["Normal (chart daily)", "Anchored: Brussels 00:00", "Anchored: each session open"], group = "VWAP")
+string vwFilter   = input.string("Off", "Hard filter on signals", options = ["Off", "With trend", "Counter trend"], group = "VWAP")
+
+bool sendWebhook  = input.bool(true, "Send alert() JSON on signals", group = "Webhook")
+string brokerSym  = input.string("", "Broker symbol in JSON (blank = chart ticker)", group = "Webhook")
+string passphrase = input.string("change-me", "Webhook passphrase", group = "Webhook")
+float riskPct     = input.float(0.5, "Risk % per trade (server calculates the lot size)", minval = 0.01, step = 0.05, group = "Webhook")
+
+// ---------------- CONSTANTS ----------------
+const string TZ = "Europe/Brussels"
+const int MAXL = 8                          // max SL multipliers and max RR values
+const int NCELL = 4 * 3 * MAXL * MAXL       // setup x vwap side x SL x RR
+const int KMAX = 100                        // max memory window per combo
+int minNeff = memK > 0 ? math.min(posMinN, memK) : posMinN
+
+array<string> setNames = array.from("1 BO Long", "2 REV Short", "3 BO Short", "4 REV Long")
+
+// ---------------- SCAN LISTS ----------------
+parseList(string s, float minV) =>
+    array<float> out = array.new<float>()
+    array<string> parts = str.split(str.replace_all(s, " ", ""), ",")
+    for i = 0 to array.size(parts) - 1
+        float v = str.tonumber(array.get(parts, i))
+        if not na(v) and v > 0 and array.size(out) < MAXL
+            array.push(out, math.max(v, minV))
+    if array.size(out) == 0
+        array.push(out, math.max(1.0, minV))
+    array.sort(out)
+    out
+
+var array<float> slBO = parseList(slBOtxt, 0.0001)
+var array<float> slREV = parseList(slREVtxt, 2.0)
+var array<float> rrL = parseList(rrListTxt, 0.0001)
+
+slOf(int setup) =>
+    (setup == 0 or setup == 2) ? slBO : slREV
+
+// cell index: ((setup*3 + vwapSide) * MAXL + slIdx) * MAXL + rrIdx ; vwapSide 0 all, 1 with, 2 agst
+cellIdx(int setup, int v, int si, int ri) =>
+    ((setup * 3 + v) * MAXL + si) * MAXL + ri
+
+siOf(int c) =>
+    int(math.floor(c / MAXL)) % MAXL
+
+riOf(int c) =>
+    c % MAXL
+
+// ---------------- TYPES ----------------
+type Trade
+    float entry
+    float d            // stop distance in price
+    int dir
+    int setup
+    int vwc            // 0 unknown, 1 with VWAP, 2 against VWAP
+    int si             // SL multiplier index
+    float mfe          // best move in favour so far (price units)
+    int nWon           // how many RR levels already booked as wins
+    int endTime
+
+type Zone
+    string name
+    color col
+    float hi = na
+    float lo = na
+    int endTime = 0
+    bool inSess = false
+    bool active = false
+    bool boH = false
+    bool boL = false
+    bool rvH = false
+    bool rvL = false
+    bool seenA = false
+    bool seenB = false
+    float cumPV = 0.0
+    float cumV = 0.0
+    float avw = na
+    box bx = na
+
+// ---------------- STATE ----------------
+var array<Zone> zones = array.from(
+     Zone.new(name = "Asia", col = color.blue),
+     Zone.new(name = "London", col = color.orange),
+     Zone.new(name = "America", col = color.purple))
+var array<Trade> openTrades = array.new<Trade>()
+var array<float> resN = array.new<float>(NCELL, 0.0)
+var array<float> wins = array.new<float>(NCELL, 0.0)
+var array<float> sumR = array.new<float>(NCELL, 0.0)
+var array<float> rollBuf = array.new<float>(NCELL * KMAX, 0.0)
+var array<int> headA = array.new<int>(NCELL, 0)
+var array<int> cntA = array.new<int>(NCELL, 0)
+var table tb = na
+var table tc = na
+var table tg = na
+
+// ---------------- VWAP ----------------
+bool newBxDay = nz(ta.change(dayofmonth(time, TZ))) != 0
+float vwN = ta.vwap(hlc3)
+float vwA = ta.vwap(hlc3, newBxDay)
+float vwBox = na
+float atrV = ta.atr(14)
+
+// ---------------- SESSIONS ----------------
+bool s0 = not na(time(timeframe.period, "0300-0900", TZ))
+bool s1 = not na(time(timeframe.period, "0930-1500", TZ))
+bool s2 = not na(time(timeframe.period, "1530-0000", TZ))
+array<bool> inNow = array.from(s0, s1, s2)
+
+// ---------------- HELPERS ----------------
+classify(int dir, float v) =>
+    int r = 0
+    if not na(v)
+        if dir == 1
+            r := close > v ? 1 : close < v ? 2 : 0
+        else
+            r := close < v ? 1 : close > v ? 2 : 0
+    r
+
+passes(int vc) =>
+    vwFilter == "Off" or (vwFilter == "With trend" and vc == 1) or (vwFilter == "Counter trend" and vc == 2)
+
+// best SL/RR cell of a setup + vwap side (-1 when no combo has enough trades)
+bestCell(int setup, int v) =>
+    array<float> sl = slOf(setup)
+    int ns = array.size(sl)
+    int nr = array.size(rrL)
+    float bestScore = na
+    int bc = -1
+    for si = 0 to ns - 1
+        for ri = 0 to nr - 1
+            int c = cellIdx(setup, v, si, ri)
+            float n = array.get(resN, c)
+            if n >= minNeff
+                float tot = array.get(sumR, c)
+                float score = rankBy == "Avg R" ? tot / n : tot
+                if na(bestScore) or score > bestScore
+                    bestScore := score
+                    bc := c
+    bc
+
+cfgTxt(int st, int v) =>
+    int bc = bestCell(st, v)
+    bc >= 0 ? str.tostring(array.get(slOf(st), siOf(bc))) + " / " + str.tostring(array.get(rrL, riOf(bc))) : "-"
+
+isBlocked(int setup) =>
+    bool b = false
+    if oneTrade
+        int n = array.size(openTrades)
+        if n > 0
+            for t = 0 to n - 1
+                Trade x = array.get(openTrades, t)
+                if x.setup == setup and time < x.endTime
+                    b := true
+    b
+
+recordR(Trade tr, int ri, float r) =>
+    for vi = 0 to 1
+        if vi == 0 or tr.vwc > 0
+            int v = vi == 0 ? 0 : tr.vwc
+            int c = cellIdx(tr.setup, v, tr.si, ri)
+            if memK > 0
+                int h = array.get(headA, c)
+                int cnt = array.get(cntA, c)
+                if cnt >= memK
+                    // window full: drop the oldest result before adding the new one
+                    float old = array.get(rollBuf, c * KMAX + h)
+                    array.set(resN, c, array.get(resN, c) - 1)
+                    array.set(sumR, c, array.get(sumR, c) - old)
+                    if old > 0
+                        array.set(wins, c, array.get(wins, c) - 1)
+                else
+                    array.set(cntA, c, cnt + 1)
+                array.set(rollBuf, c * KMAX + h, r)
+                array.set(headA, c, (h + 1) % memK)
+            array.set(resN, c, array.get(resN, c) + 1)
+            array.set(sumR, c, array.get(sumR, c) + r)
+            if r > 0
+                array.set(wins, c, array.get(wins, c) + 1)
+
+// One tracker per signal and SL multiplier. It books every RR level on the way:
+// a win when the move in favour reaches RR x stop, a loss when the stop is hit first.
+updateTrades() =>
+    int n = array.size(openTrades)
+    int nr = array.size(rrL)
+    if n > 0
+        for t = n - 1 to 0
+            Trade tr = array.get(openTrades, t)
+            bool hitSL = tr.dir == 1 ? low <= tr.entry - tr.d : high >= tr.entry + tr.d
+            if hitSL
+                if tr.nWon < nr
+                    for k = tr.nWon to nr - 1
+                        recordR(tr, k, -1.0)
+                array.remove(openTrades, t)
+            else
+                float fav = tr.dir == 1 ? high - tr.entry : tr.entry - low
+                tr.mfe := math.max(tr.mfe, fav)
+                while tr.nWon < nr and tr.mfe >= tr.d * array.get(rrL, tr.nWon)
+                    recordR(tr, tr.nWon, array.get(rrL, tr.nWon))
+                    tr.nWon := tr.nWon + 1
+                if tr.nWon >= nr
+                    array.remove(openTrades, t)
+
+// Creates the virtual trackers (always, for the scanner). Returns true when it is also a live signal.
+openNewTrade(int setup, string sessName, int dir, float dist, int vwc, int endTime, bool take, float liveSL, float liveRR) =>
+    bool fired = false
+    array<float> sl = slOf(setup)
+    for si = 0 to array.size(sl) - 1
+        float dT = math.max(dist * array.get(sl, si), minStop)
+        if dT > syminfo.mintick
+            array.push(openTrades, Trade.new(entry = close, d = dT, dir = dir, setup = setup, vwc = vwc, si = si, mfe = 0.0, nWon = 0, endTime = endTime))
+    if take
+        float dL = math.max(dist * liveSL, minStop)
+        if dL > syminfo.mintick
+            fired := true
+            float slp = close - dir * dL
+            float tpp = close + dir * dL * liveRR
+            string act = dir == 1 ? "BUY" : "SELL"
+            string vwTxt = vwc == 1 ? "with" : vwc == 2 ? "agst" : "?"
+            if showTag
+                string tag = array.get(setNames, setup) + "\nSL x" + str.tostring(liveSL) + " | RR " + str.tostring(liveRR) + "\n" + vwTxt + " VWAP"
+                float ty = dir == 1 ? low - nz(atrV) * 0.8 : high + nz(atrV) * 0.8
+                label.new(bar_index, ty, tag, style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(dir == 1 ? color.green : color.red, 60), textcolor = color.white, size = size.tiny)
+            if showLines
+                int x2 = bar_index + lineBars
+                line.new(bar_index, close, x2, close, color = color.new(color.gray, 25), width = 1)
+                line.new(bar_index, slp, x2, slp, color = color.new(color.red, 25), width = 1)
+                line.new(bar_index, tpp, x2, tpp, color = color.new(color.green, 25), width = 1)
+                if showLineTxt
+                    label.new(x2, close, "E " + str.tostring(close, format.mintick), style = label.style_label_left, color = color.new(color.gray, 100), textcolor = color.new(color.gray, 20), size = size.tiny)
+                    label.new(x2, slp, "SL " + str.tostring(slp, format.mintick), style = label.style_label_left, color = color.new(color.red, 100), textcolor = color.new(color.red, 20), size = size.tiny)
+                    label.new(x2, tpp, "TP " + str.tostring(tpp, format.mintick), style = label.style_label_left, color = color.new(color.green, 100), textcolor = color.new(color.green, 20), size = size.tiny)
+            if sendWebhook
+                string sym = brokerSym == "" ? syminfo.ticker : brokerSym
+                string js = '{"passphrase":"' + passphrase + '","id":"' + syminfo.ticker + '-' + str.tostring(time) + '-' + str.tostring(setup + 1) + '","symbol":"' + sym + '","action":"' + act + '","setup":"' + array.get(setNames, setup) + '","vwap":"' + vwTxt + '","session":"' + sessName + '","entry":' + str.tostring(close, format.mintick) + ',"sl":' + str.tostring(slp, format.mintick) + ',"tp":' + str.tostring(tpp, format.mintick) + ',"sl_mult":' + str.tostring(liveSL) + ',"sl_dist":' + str.tostring(dL, format.mintick) + ',"tp_dist":' + str.tostring(dL * liveRR, format.mintick) + ',"rr":' + str.tostring(liveRR) + ',"risk_pct":' + str.tostring(riskPct) + '}'
+                alert(js, alert.freq_once_per_bar_close)
+    fired
+
+// Decides SL multiplier + RR for the live trade, then opens the trackers.
+fireSetup(int setup, string sessName, int dir, float dist, int vc, int endTime) =>
+    bool take = false
+    float lSL = 1.0
+    float lRR = 1.0
+    int bc = bestCell(setup, vc)
+    if modeSel == "Manual SL/RR (all 4)"
+        bool isBO = setup == 0 or setup == 2
+        lSL := isBO ? mBoSL : math.max(mRevSL, 2.0)
+        lRR := isBO ? mBoRR : mRevRR
+        take := passes(vc)
+    else if bc >= 0
+        if array.get(sumR, bc) > posMinTot and passes(vc)
+            take := true
+            lSL := array.get(slOf(setup), siOf(bc))
+            lRR := array.get(rrL, riOf(bc))
+    openNewTrade(setup, sessName, dir, dist, vc, endTime, take, lSL, lRR)
+
+// ---------------- MAIN ----------------
+bool sigBuy = false
+bool sigSell = false
+
+if barstate.isconfirmed
+    updateTrades()
+    bool bull = close > open
+    bool bear = close < open
+    float candleD = candleDist == "Body" ? math.abs(close - open) : high - low
+
+    for i = 0 to 2
+        Zone z = array.get(zones, i)
+        bool nowIn = array.get(inNow, i)
+
+        // session-anchored VWAP (resets at session open, runs through the window)
+        if nowIn and not z.inSess
+            z.cumPV := 0.0
+            z.cumV := 0.0
+        if nowIn or z.active or z.inSess
+            z.cumPV += hlc3 * nz(volume)
+            z.cumV += nz(volume)
+            z.avw := z.cumV > 0 ? z.cumPV / z.cumV : na
+            vwBox := z.avw
+
+        if nowIn
+            if not z.inSess
+                z.hi := high
+                z.lo := low
+                z.active := false
+                z.boH := false
+                z.boL := false
+                z.rvH := false
+                z.rvL := false
+                z.seenA := false
+                z.seenB := false
+                z.bx := box.new(bar_index, high, bar_index, low, border_color = z.col, bgcolor = color.new(z.col, 90))
+            else
+                z.hi := math.max(z.hi, high)
+                z.lo := math.min(z.lo, low)
+                if not na(z.bx)
+                    box.set_top(z.bx, z.hi)
+                    box.set_bottom(z.bx, z.lo)
+                    box.set_right(z.bx, bar_index)
+        else
+            if z.inSess
+                z.active := true
+                if not na(z.bx)
+                    box.set_top(z.bx, z.hi)
+                    box.set_bottom(z.bx, z.lo)
+                    box.set_right(z.bx, bar_index - 1)
+                z.endTime := time + windowMin * 60000
+
+            if z.active
+                if time < z.endTime
+                    float zh = z.hi
+                    float zl = z.lo
+                    bool sA = z.seenA or (wickSweep and high > zh)
+                    bool sB = z.seenB or (wickSweep and low < zl)
+
+                    float vwU = vwType == "Normal (chart daily)" ? vwN : vwType == "Anchored: Brussels 00:00" ? vwA : z.avw
+                    int vcL = classify(1, vwU)
+                    int vcS = classify(-1, vwU)
+
+                    // 1 BO Long
+                    if bull and close > zh and not z.boH
+                        z.boH := true
+                        if not isBlocked(0)
+                            if fireSetup(0, z.name, 1, close - zl, vcL, z.endTime)
+                                sigBuy := true
+                    // 2 REV Short
+                    if bear and close < zh and sA and not z.rvH
+                        z.rvH := true
+                        if not isBlocked(1)
+                            if fireSetup(1, z.name, -1, candleD, vcS, z.endTime)
+                                sigSell := true
+                    // 3 BO Short
+                    if bear and close < zl and not z.boL
+                        z.boL := true
+                        if not isBlocked(2)
+                            if fireSetup(2, z.name, -1, zh - close, vcS, z.endTime)
+                                sigSell := true
+                    // 4 REV Long
+                    if bull and close > zl and sB and not z.rvL
+                        z.rvL := true
+                        if not isBlocked(3)
+                            if fireSetup(3, z.name, 1, candleD, vcL, z.endTime)
+                                sigBuy := true
+
+                    z.seenA := z.seenA or (wickSweep ? high > zh : close > zh)
+                    z.seenB := z.seenB or (wickSweep ? low < zl : close < zl)
+
+                if time_close >= z.endTime
+                    z.active := false
+
+        z.inSess := nowIn
+
+// ---------------- PLOTS ----------------
+float vwPlot = vwType == "Normal (chart daily)" ? vwN : vwType == "Anchored: Brussels 00:00" ? vwA : vwBox
+plot(vwPlot, "VWAP", color = color.new(color.yellow, 20), linewidth = 1)
+
+plotshape(sigBuy, "BUY", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(sigSell, "SELL", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+alertcondition(sigBuy, "BUY signal", "BUY signal on {{ticker}}")
+alertcondition(sigSell, "SELL signal", "SELL signal on {{ticker}}")
+
+// ---------------- SCANNER TABLE (bottom right) ----------------
+// per setup x VWAP side: best SL multiplier + RR and its results
+if barstate.islast and showScanner
+    if na(tb)
+        tb := table.new(position.bottom_right, 9, 14, border_width = 1, frame_color = color.gray, border_color = color.gray)
+    table.clear(tb, 0, 0, 8, 13)
+
+    string title = "SCANNER | " + modeSel + " | ranked by " + rankBy + " | min N " + str.tostring(minNeff) + " | memory " + (memK > 0 ? "last " + str.tostring(memK) : "all") + " | open " + str.tostring(array.size(openTrades))
+    table.cell(tb, 0, 0, title, text_color = color.black, bgcolor = color.new(color.yellow, 40), text_size = size.small)
+    table.merge_cells(tb, 0, 0, 8, 0)
+
+    array<string> hdr = array.from("Setup", "VWAP", "SL x", "RR", "N", "WR%", "Tot R", "Avg R", "On")
+    for hc = 0 to 8
+        table.cell(tb, hc, 1, array.get(hdr, hc), text_color = color.black, bgcolor = color.new(color.gray, 30), text_size = size.tiny)
+
+    array<string> vwTxtA = array.from("all", "with", "agst")
+    int row = 1
+    for st = 0 to 3
+        for v = 0 to 2
+            row += 1
+            int bc = bestCell(st, v)
+            bool has = bc >= 0
+            float n = has ? array.get(resN, bc) : 0.0
+            float tot = has ? array.get(sumR, bc) : na
+            float wr = has ? array.get(wins, bc) / n * 100 : na
+            float avg = has ? tot / n : na
+            bool on = has and v > 0 and modeSel == "Auto best (positive only)" and tot > posMinTot
+            color bg = on ? color.new(color.lime, 35) : color.new(color.white, 15)
+            color rc = not has or on ? color.black : (tot > 0 ? color.green : color.red)
+            table.cell(tb, 0, row, array.get(setNames, st), text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 1, row, array.get(vwTxtA, v), text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 2, row, has ? str.tostring(array.get(slOf(st), siOf(bc))) : "-", text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 3, row, has ? str.tostring(array.get(rrL, riOf(bc))) : "-", text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 4, row, has ? str.tostring(n, "0") : "-", text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 5, row, has ? str.tostring(wr, "0.0") : "-", text_color = color.black, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 6, row, has ? str.tostring(tot, "0.0") : "-", text_color = rc, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 7, row, has ? str.tostring(avg, "0.00") : "-", text_color = rc, bgcolor = bg, text_size = size.tiny)
+            table.cell(tb, 8, row, on ? "ON" : "", text_color = color.black, bgcolor = bg, text_size = size.tiny)
+
+// ---------------- BEST SL x / RR TABLE (top middle) ----------------
+if barstate.islast and showCfgTbl
+    if na(tc)
+        tc := table.new(position.top_center, 4, 6, border_width = 1, frame_color = color.gray, border_color = color.gray)
+    color hb = color.new(color.yellow, 40)
+    table.cell(tc, 0, 0, "Best SL x / RR", text_color = color.black, bgcolor = hb, text_size = size.small)
+    table.merge_cells(tc, 0, 0, 3, 0)
+    array<string> h2 = array.from("Setup", "all", "with", "agst")
+    for hc = 0 to 3
+        table.cell(tc, hc, 1, array.get(h2, hc), text_color = color.black, bgcolor = color.new(color.gray, 30), text_size = size.tiny)
+    for st = 0 to 3
+        table.cell(tc, 0, st + 2, array.get(setNames, st), text_color = color.black, bgcolor = color.new(color.white, 15), text_size = size.tiny)
+        for v = 0 to 2
+            table.cell(tc, v + 1, st + 2, cfgTxt(st, v), text_color = color.black, bgcolor = color.new(color.white, 15), text_size = size.tiny)
+
+// ---------------- GRID VIEW (top right): Tot R for every SL x / RR of one setup + VWAP side ----------------
+if barstate.islast and gridSetup != "Off"
+    if na(tg)
+        tg := table.new(position.top_right, MAXL + 1, MAXL + 2, border_width = 1, frame_color = color.gray, border_color = color.gray)
+    table.clear(tg, 0, 0, MAXL, MAXL + 1)
+    int gs = gridSetup == "1 BO Long" ? 0 : gridSetup == "2 REV Short" ? 1 : gridSetup == "3 BO Short" ? 2 : 3
+    int gv = gridSide == "all" ? 0 : gridSide == "with" ? 1 : 2
+    array<float> gsl = slOf(gs)
+    int gns = array.size(gsl)
+    int gnr = array.size(rrL)
+    int gbc = bestCell(gs, gv)
+    table.cell(tg, 0, 0, gridSetup + " | " + gridSide + " VWAP | Tot R", text_color = color.black, bgcolor = color.new(color.yellow, 40), text_size = size.small)
+    table.merge_cells(tg, 0, 0, gnr, 0)
+    table.cell(tg, 0, 1, "SL x / RR", text_color = color.black, bgcolor = color.new(color.gray, 30), text_size = size.tiny)
+    for ri = 0 to gnr - 1
+        table.cell(tg, ri + 1, 1, str.tostring(array.get(rrL, ri)), text_color = color.black, bgcolor = color.new(color.gray, 30), text_size = size.tiny)
+    for si = 0 to gns - 1
+        table.cell(tg, 0, si + 2, str.tostring(array.get(gsl, si)), text_color = color.black, bgcolor = color.new(color.gray, 30), text_size = size.tiny)
+        for ri = 0 to gnr - 1
+            int c = cellIdx(gs, gv, si, ri)
+            float n = array.get(resN, c)
+            float tot = array.get(sumR, c)
+            color gc = n == 0 ? color.black : (tot > 0 ? color.green : color.red)
+            color gbg = c == gbc ? color.new(color.yellow, 30) : color.new(color.white, 15)
+            table.cell(tg, ri + 1, si + 2, n > 0 ? str.tostring(tot, "0.0") : "-", text_color = gc, bgcolor = gbg, text_size = size.tiny)
