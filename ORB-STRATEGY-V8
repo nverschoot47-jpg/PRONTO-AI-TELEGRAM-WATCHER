@@ -1,0 +1,683 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © eltrudi
+
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © eltrudi
+
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+// PRONTO ORB · ALLEEN GEVERIFIEERDE SLOTS  ·  v8 + P&L (03-11-2026)
+//  →  Railway / MetaApi / MT5
+//
+// T.O.V. v7 + P&L: ALLEEN DE SLOT-PARAMETERS ZIJN VERVANGEN (11 setups uit de
+//   scan van 03-11 en de vergelijking met v4/v5.2/v6/v7). Logica, P&L-rapport,
+//   monitor en webhook-payload zijn identiek aan v7 + P&L.
+//
+//   Nr   slot         ORB  VWAP    SL×   RR    venster   OOS n   OOS R
+//   S1   MGC 03:00    10m  Met     x1.5  3R     60m       16     +0.51
+//   S2   MNQ 04:30    30m  Met     x1.5  2.5R   60m       11     +0.27   OOS n klein
+//   S3   MGC 05:00    30m  Met     x1.5  2.5R  120m       18     +0.36
+//   S4   MNQ 07:00    20m  Met     x1.5  2.5R   30m        7     +0.50   v7-cijfers, nog niet in scan 03-11 gezien
+//   S5   UK100 07:30  20m  Met     x2.5  2R    120m       22     +0.02   zwakste lijn, half risico
+//   S6   GER40 08:30  20m  Met     x1.5  1.5R   60m       23     +0.20
+//   S7   MGC 10:00    10m  Met     x2    3R     60m       17     +0.41
+//   S8   UK100 13:00  10m  Met     x1.5  2R     60m       16     +0.50   v4 had 13:00 met Tegen: eerst testen
+//   S9   MNQ 14:00    10m  Tegen   x1.5  3R    300m       17     +0.02   OOS daalt over 3 scans
+//   S10  MNQ 18:30    15m  Met     x1.5  1.5R  180m       18     +0.42
+//   S11  GER40 19:30  10m  Tegen   x2.5  3R    180m       16     +1.04
+//
+// De S-nummers hierboven gelden over alle symbolen; op de chart telt het
+// label per symbool (S1, S2, ... binnen de preset van dat symbool).
+//
+// LET OP — dit zijn kandidaten, geen bevestigde edges:
+//   • Shortlist uit één scan; nog niet bevestigd met script 2 (vaste slots).
+//   • De baseline voor de monitor is de OOS R uit de tabel; voor MNQ 07:00
+//     is dat het oude v7-cijfer (n=7).
+//
+// P&L-RAPPORT (ongewijzigd t.o.v. v7 + P&L):
+//   SL-hit = -VERLIES (standaard 150), TP-hit = +VERLIES x RR, timeout =
+//   werkelijk behaald R x VERLIES. Per dag / week / maand en per weekdag, per
+//   chart (symbool). Webhook en monitor zijn niet aangeraakt.
+//
+// ÉÉN TRADE PER (STARTTIJD + ORB-LENGTE) blijft als vangnet staan.
+//
+// HOUDTIJD
+//   Standaard 100000 minuten = praktisch onbegrensd, bewust (zie v7).
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("PRONTO ORB · 03/11/2026 v8 + P&L", overlay = true,
+     max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+
+gA = "① Algemeen"
+gB = "② Risico & exit"
+gC = "③ Weergave"
+gD = "④ Monitor"
+
+preset  = input.string("Auto", "Preset",
+     options = ["Auto", "MGC", "MNQ", "GER", "UK"], group = gA,
+     tooltip = "Auto = herkent het chartsymbool zelf. Geen toggle nodig.\n" +
+               "Alleen instrumenten met apart geverifieerde slots staan hier —\n" +
+               "OIL, BTC, ETH, XRP, SOL, SIL zijn bewust weggelaten.")
+TZ      = input.string("Europe/Brussels", "Tijdzone",
+     options = ["Europe/Brussels", "America/New_York", "GMT+1", "GMT+0"], group = gA)
+symOver = input.string("", "Symbool override (leeg = chart-ticker)", group = gA)
+alertsAan = input.bool(true, "Webhook-alerts aan", group = gA)
+
+houdMin = input.int(100000, "Max houdtijd (minuten)", minval = 5, step = 5, group = gB,
+     tooltip = "100000 = praktisch onbegrensd, en dat hoort ook.\n\n" +
+               "De scanner mat deze cijfers ZONDER houdtijdlimiet, en de bridge sluit\n" +
+               "posities niet op tijd. Zet je hier 120, dan sluit dit script intern\n" +
+               "na 2 uur af terwijl je live positie doorloopt — twee verschillende\n" +
+               "strategieën, en de tabel hieronder meet dan de verkeerde.")
+riskPct = input.float(0.25, "Risk % per trade (alleen logging)", minval = 0.01, step = 0.05, group = gB,
+     tooltip = "Gaat mee in de webhook maar doet niets meer: de bridge rekent met een\n" +
+               "vast bedrag (RISK_EUR). Blijft staan zodat de payload ongewijzigd is.")
+
+lijnBars = input.int(8, "SL/TP lijnlengte (bars)", minval = 2, maxval = 60, group = gC)
+labelVol = input.bool(false, "Volledig label (i.p.v. pijl + tooltip)", group = gC)
+toonBox  = input.bool(true, "ORB-boxen",     group = gC)
+toonLbl  = input.bool(true, "Entry-labels",  group = gC)
+toonLijn = input.bool(true, "SL/TP-lijnen",  group = gC)
+toonTab  = input.bool(true, "Controletabel", group = gC)
+toonGeblok = input.bool(false, "Geblokkeerde slots in tabel tonen", group = gC)
+toonVwap = input.bool(true, "VWAP tekenen", group = gC)
+vwAnker  = input.string("Sessie", "VWAP-anker", options = ["Sessie", "Dag (tijdzone)"], group = gC,
+     tooltip = "Sessie = reset bij de futures-sessieopen. Dít gebruikte de scanner ook.\n" +
+               "Wijk je hier af, dan neem je andere trades dan je gemeten hebt.")
+
+monAan   = input.bool(true, "Degradatie-monitor aan", group = gD)
+rollN    = input.int(20, "Rollend venster (laatste N trades per slot)", minval = 10, maxval = 100, group = gD)
+minTr    = input.int(10, "Minimum trades voor een oordeel", minval = 5, maxval = 50, group = gD,
+     tooltip = "Onder dit aantal toont de monitor '…' i.p.v. een oordeel — te weinig\n" +
+               "data om onderscheid te maken van ruis.")
+warnMarg = input.float(0.3, "Marge onder backtest-EV(R) voor 'zwak'", minval = 0.05, step = 0.05, group = gD,
+     tooltip = "Status wordt 'zwak' (oranje) als het rollend gemiddelde R meer dan dit\n" +
+               "bedrag onder de backtest-EV(R) van dat slot zakt. Status wordt 'LOSS'\n" +
+               "(rood) zodra het rollend gemiddelde zelf negatief is, ongeacht marge.")
+
+gE = "⑤ P&L-rapport"
+pnlAan    = input.bool(true, "P&L-rapport tonen", group = gE)
+verliesEur = input.float(150.0, "Vast verlies per trade (€)", minval = 1.0, step = 10.0, group = gE,
+     tooltip = "Elke SL-hit = -dit bedrag. Elke TP-hit = dit bedrag × RR van het slot.\n" +
+               "Houd dit gelijk aan RISK_EUR in de bridge, anders klopt het rapport\n" +
+               "niet met wat je echt verhandelt. Kosten (spread, commissie, slippage)\n" +
+               "zitten er NIET in.")
+rapPer    = input.string("Dag", "Periode-lijst", options = ["Dag", "Week", "Maand"], group = gE,
+     tooltip = "Welke periodes in de lijst onderaan het rapport staan. De rijen\n" +
+               "Vandaag / Deze week / Deze maand / Totaal staan er altijd.")
+rapRij    = input.int(10, "Aantal periodes in de lijst", minval = 3, maxval = 30, group = gE)
+posRap    = input.string("top right", "Positie rapport",
+     options = ["top right", "middle right", "bottom left", "middle left", "top center", "bottom center"], group = gE)
+posWd     = input.string("bottom left", "Positie weekdag-tabel",
+     options = ["top right", "middle right", "bottom left", "middle left", "top center", "bottom center"], group = gE)
+
+// ── Symboolherkenning — alleen de 4 geverifieerde instrumenten ────────────
+_tk = str.upper(syminfo.ticker)
+_isG = str.contains(_tk, "MGC") or str.contains(_tk, "XAU") or str.contains(_tk, "GOLD")
+_isN = str.contains(_tk, "MNQ") or str.contains(_tk, "NAS")
+_isD = str.contains(_tk, "GER") or str.contains(_tk, "DAX")
+_isU = str.contains(_tk, "UK100") or str.contains(_tk, "FTSE")
+
+effPreset = preset != "Auto" ? preset :
+     _isG ? "MGC" : _isN ? "MNQ" : _isD ? "GER" : _isU ? "UK" : "Geen"
+
+var int N = 0
+var array<string> slDir = na
+var array<int>    slH   = na
+var array<int>    slM   = na
+var array<int>    slOrb = na
+var array<float>  slMul = na
+var array<string> slVw  = na
+var array<float>  slRR  = na
+var array<float>  slEV  = na
+var array<int>    slWin = na   // venster (min) na ORB — apart per slot geverifieerd
+var array<bool>   slAct = na
+var array<float>  slBaseEV = na  // backtest EV(R) per slot — baseline voor de monitor, na = onbekend
+
+if barstate.isfirst
+    if effPreset == "MGC"
+        // v8 (03/11): S1 03:00 / S3 05:00 / S7 10:00
+        slDir := array.from("Beide", "Beide", "Beide")
+        slH   := array.from(3, 5, 10)
+        slM   := array.from(0, 0, 0)
+        slOrb := array.from(10, 30, 10)
+        slMul := array.from(1.5, 1.5, 2.0)
+        slVw  := array.from("Met", "Met", "Met")
+        slRR  := array.from(3.0, 2.5, 3.0)
+        slEV  := array.from(880, 940, 960)        // EV(R) in-sample ×1000, voor de (start+ORB)-tiebreak
+        slWin := array.from(60, 120, 60)
+        slBaseEV := array.from(0.51, 0.36, 0.41)   // OOS R — de echte baseline voor de monitor
+    else if effPreset == "MNQ"
+        // v8 (03/11): S2 04:30 / S4 07:00 / S9 14:00 / S10 18:30
+        slDir := array.from("Beide", "Beide", "Beide", "Beide")
+        slH   := array.from(4, 7, 14, 18)
+        slM   := array.from(30, 0, 0, 30)
+        slOrb := array.from(30, 20, 10, 15)
+        slMul := array.from(1.5, 1.5, 1.5, 1.5)
+        slVw  := array.from("Met", "Met", "Tegen", "Met")
+        slRR  := array.from(2.5, 2.5, 3.0, 1.5)
+        slEV  := array.from(790, 650, 850, 410)
+        slWin := array.from(60, 30, 300, 180)
+        slBaseEV := array.from(0.27, 0.50, 0.02, 0.42)
+    else if effPreset == "GER"
+        // v8 (03/11): S6 08:30 / S11 19:30
+        slDir := array.from("Beide", "Beide")
+        slH   := array.from(8, 19)
+        slM   := array.from(30, 30)
+        slOrb := array.from(20, 10)
+        slMul := array.from(1.5, 2.5)
+        slVw  := array.from("Met", "Tegen")
+        slRR  := array.from(1.5, 3.0)
+        slEV  := array.from(270, 550)
+        slWin := array.from(60, 180)
+        slBaseEV := array.from(0.20, 1.04)
+    else if effPreset == "UK"
+        // v8 (03/11): S5 07:30 / S8 13:00
+        slDir := array.from("Beide", "Beide")
+        slH   := array.from(7, 13)
+        slM   := array.from(30, 0)
+        slOrb := array.from(20, 10)
+        slMul := array.from(2.5, 1.5)
+        slVw  := array.from("Met", "Met")
+        slRR  := array.from(2.0, 2.0)
+        slEV  := array.from(410, 360)
+        slWin := array.from(120, 60)
+        slBaseEV := array.from(0.02, 0.50)
+    else
+        // Auto vond geen van de 4 geverifieerde symbolen. Alles stil uit.
+        slDir := array.new<string>(1, "Beide")
+        slH   := array.new<int>(1, 0)
+        slM   := array.new<int>(1, 0)
+        slOrb := array.new<int>(1, 10)
+        slMul := array.new<float>(1, 1.0)
+        slVw  := array.new<string>(1, "Uit")
+        slRR  := array.new<float>(1, 1.0)
+        slEV  := array.new<float>(1, 0.0)
+        slWin := array.new<int>(1, 120)
+        slBaseEV := array.new<float>(1, na)
+
+    N := array.size(slDir)
+
+    // ── Eén winnaar per (starttijd + ORB-lengte) ──────────────────────────
+    slAct := array.new<bool>(N, effPreset != "Geen")
+    for i = 0 to N - 1
+        if array.get(slAct, i)
+            _win = true
+            for k = 0 to N - 1
+                if k != i and array.get(slAct, k)
+                    _zelfde = array.get(slH, k) == array.get(slH, i) and
+                              array.get(slM, k) == array.get(slM, i) and
+                              array.get(slOrb, k) == array.get(slOrb, i)
+                    if _zelfde
+                        _beter = array.get(slEV, k) > array.get(slEV, i) or
+                                 (array.get(slEV, k) == array.get(slEV, i) and k < i)
+                        if _beter
+                            _win := false
+            array.set(slAct, i, _win)
+
+var array<float> sHi  = na
+var array<float> sLo  = na
+var array<int>   sSig = na
+var array<box>   sBox = na
+var array<int>   cN   = na
+var array<int>   cWin = na
+var int tradeNr = 0
+
+// ── Degradatie-monitor: rollend R-venster per slot ────────────────────────
+var matrix<float> rollBuf = na   // N rijen × rollN kolommen, elke cel = R-multiple van die trade
+var array<int>    rollPos = na   // volgende schrijfpositie (circulair) per slot
+var array<int>    rollCnt = na   // aantal gevulde cellen per slot (max rollN)
+var array<float>  rollSum = na   // lopende som, voor O(1) gemiddelde
+var array<float>  slAvgR  = na   // laatste berekende rollend gemiddelde R per slot
+var array<int>    slStat  = na   // 0 = te weinig data, 1 = OK, 2 = zwak, 3 = LOSS
+
+if barstate.isfirst
+    sHi  := array.new<float>(N, na)
+    sLo  := array.new<float>(N, na)
+    sSig := array.new<int>(N, 0)
+    sBox := array.new<box>(N, na)
+    cN   := array.new<int>(N, 0)
+    cWin := array.new<int>(N, 0)
+    rollBuf := matrix.new<float>(N, rollN, na)
+    rollPos := array.new<int>(N, 0)
+    rollCnt := array.new<int>(N, 0)
+    rollSum := array.new<float>(N, 0.0)
+    slAvgR  := array.new<float>(N, na)
+    slStat  := array.new<int>(N, 0)
+
+type Pos
+    float e
+    float stop
+    float tp
+    int   dir
+    int   slot
+    int   dl
+    line  lSL
+    line  lTP
+var array<Pos> pos = array.new<Pos>()
+
+// ── P&L-rapport: aggregaten per dag / week / maand ────────────────────────
+type Agg
+    array<int>   k      // periodesleutel (dag-index, maandag-index of jjjjmm)
+    array<int>   n      // aantal trades
+    array<int>   w      // winnaars (TP)
+    array<int>   l      // verliezers (SL)
+    array<int>   t      // timeouts (gesloten op tijd, ni winst ni SL)
+    array<float> pnl    // netto € in die periode
+
+newAgg() => Agg.new(array.new<int>(), array.new<int>(), array.new<int>(), array.new<int>(), array.new<int>(), array.new<float>())
+
+var Agg aD = newAgg()
+var Agg aW = newAgg()
+var Agg aM = newAgg()
+
+// kind: 1 = TP, 2 = SL, 3 = timeout. Trades sluiten chronologisch, dus alleen de laatste periode kan open staan.
+addAgg(Agg a, int key, int kind, float val) =>
+    int sz = a.k.size()
+    if sz == 0 or a.k.last() != key
+        a.k.push(key), a.n.push(0), a.w.push(0), a.l.push(0), a.t.push(0), a.pnl.push(0.0)
+        sz += 1
+    int j = sz - 1
+    a.n.set(j, a.n.get(j) + 1)
+    if kind == 1
+        a.w.set(j, a.w.get(j) + 1)
+    else if kind == 2
+        a.l.set(j, a.l.get(j) + 1)
+    else
+        a.t.set(j, a.t.get(j) + 1)
+    a.pnl.set(j, a.pnl.get(j) + val)
+    sz
+
+// Per weekdag (0 = maandag ... 6 = zondag), op sluitdag van de trade
+var array<int>   wdDays = array.new<int>(7, 0)     // aantal dagen met minstens 1 gesloten trade
+var array<int>   wdLast = array.new<int>(7, -1)    // laatst getelde dag-index per weekdag
+var array<int>   wdN    = array.new<int>(7, 0)
+var array<int>   wdW    = array.new<int>(7, 0)
+var array<int>   wdL    = array.new<int>(7, 0)
+var array<int>   wdT    = array.new<int>(7, 0)
+var array<float> wdP    = array.new<float>(7, 0.0)
+
+posOf(string s) =>
+    s == "top right" ? position.top_right :
+     s == "middle right" ? position.middle_right :
+     s == "bottom left" ? position.bottom_left :
+     s == "middle left" ? position.middle_left :
+     s == "top center" ? position.top_center : position.bottom_center
+
+fmtE(float v) =>
+    int r = int(math.round(v))
+    (r > 0 ? "+" : "") + str.tostring(r)
+
+colE(float v) => v > 0 ? color.new(color.lime, 0) : v < 0 ? color.new(color.red, 0) : color.new(color.gray, 20)
+
+fmtHit(int w, int l) => (w + l) > 0 ? str.tostring(int(math.round(w * 100.0 / (w + l)))) + "%" : "—"
+
+putRow(table tb, int row, string lbl, int n, int w, int l, int t, float pnl) =>
+    table.cell(tb, 0, row, lbl, text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, row, str.tostring(n), text_color = color.white, text_size = size.tiny)
+    table.cell(tb, 2, row, str.tostring(w), text_color = color.new(color.lime, 0), text_size = size.tiny)
+    table.cell(tb, 3, row, str.tostring(l), text_color = color.new(color.red, 0), text_size = size.tiny)
+    table.cell(tb, 4, row, str.tostring(t), text_color = color.new(color.gray, 20), text_size = size.tiny)
+    table.cell(tb, 5, row, fmtHit(w, l), text_color = color.white, text_size = size.tiny)
+    table.cell(tb, 6, row, fmtE(pnl), text_color = colE(pnl), text_size = size.tiny)
+    table.cell(tb, 7, row, n > 0 ? fmtE(pnl / n) : "—", text_color = colE(pnl), text_size = size.tiny)
+    0
+
+putAgg(table tb, int row, string lbl, Agg a, int idx) =>
+    if idx >= 0
+        putRow(tb, row, lbl, a.n.get(idx), a.w.get(idx), a.l.get(idx), a.t.get(idx), a.pnl.get(idx))
+    else
+        putRow(tb, row, lbl, 0, 0, 0, 0, 0.0)
+    0
+
+lastIdx(Agg a, int key) => a.k.size() > 0 and a.k.last() == key ? a.k.size() - 1 : -1
+
+dagLbl(int key) => str.format_time(key * 86400000 + 43200000, "dd/MM EEE", "UTC")
+wekLbl(int key) => "wk " + str.format_time(key * 86400000 + 43200000, "dd/MM", "UTC")
+maaLbl(int key) => str.format("{0,number,00}/{1,number,0}", key % 100, int(math.floor(key / 100.0)))
+
+barMin = hour(time, TZ) * 60 + minute(time, TZ)
+newDay = ta.change(time("D")) != 0
+_vwSes = ta.vwap(hlc3)
+_vwDag = ta.vwap(hlc3, newDay)
+vw     = vwAnker == "Sessie" ? _vwSes : _vwDag
+dec    = syminfo.mintick >= 0.01 ? 2 : 5
+sym    = symOver == "" ? syminfo.ticker : symOver
+mag    = effPreset != "Geen"
+
+// ── P&L-rapport: periodesleutels op basis van de gekozen tijdzone ──────────
+// Dag-index = aantal dagen sinds 1970-01-01 (lokale kalenderdag, via 12:00 lokaal
+// zodat zomer/wintertijd niets verschuift). 1970-01-01 was een donderdag →
+// weekdag (0 = maandag) = (dag-index + 3) % 7.
+dIdx  = int(math.floor(timestamp(TZ, year(time, TZ), month(time, TZ), dayofmonth(time, TZ), 12, 0) / 86400000.0))
+wdIdx = (dIdx + 3) % 7
+wkKey = dIdx - wdIdx
+moKey = year(time, TZ) * 100 + month(time, TZ)
+
+if newDay
+    for i = 0 to N - 1
+        array.set(sHi, i, na), array.set(sLo, i, na)
+        array.set(sSig, i, 0), array.set(sBox, i, na)
+
+orders = array.new<string>()
+
+if barstate.isconfirmed and mag
+    for i = 0 to N - 1
+        if array.get(slAct, i)
+            _st  = array.get(slH, i) * 60 + array.get(slM, i)
+            _en  = _st + array.get(slOrb, i)
+            _win = array.get(slWin, i)   // eigen geverifieerd venster per slot
+
+            if barMin >= _st and barMin < _en
+                _h = array.get(sHi, i), _l = array.get(sLo, i)
+                array.set(sHi, i, na(_h) ? high : math.max(_h, high))
+                array.set(sLo, i, na(_l) ? low  : math.min(_l, low))
+                if toonBox
+                    _bx = array.get(sBox, i)
+                    if na(_bx)
+                        array.set(sBox, i, box.new(bar_index, high, bar_index, low,
+                             border_color = color.new(color.orange, 35),
+                             bgcolor = color.new(color.orange, 91),
+                             text = "S" + str.tostring(i + 1) + " " + str.tostring(array.get(slOrb, i)) + "m",
+                             text_color = color.new(color.orange, 30), text_size = size.tiny))
+                    else
+                        box.set_right(_bx, bar_index)
+                        box.set_top(_bx, array.get(sHi, i)), box.set_bottom(_bx, array.get(sLo, i))
+
+            if barMin >= _en and barMin < _en + _win and array.get(sSig, i) == 0
+                _hi = array.get(sHi, i), _lo = array.get(sLo, i)
+                if not na(_hi) and not na(_lo)
+                    _up = close > _hi and close[1] <= _hi
+                    _dn = close < _lo and close[1] >= _lo
+                    if _up or _dn
+                        _lg = _up
+                        _vs = array.get(slVw, i)
+                        _vOk = _vs == "Uit" ? true : _vs == "Met" ? (_lg ? close > vw : close < vw) : (_lg ? close < vw : close > vw)
+                        if _vOk
+                            _ruw = _lg ? close - _lo : _hi - close
+                            _d   = math.max(_ruw, syminfo.mintick)
+                            _stp = _d * array.get(slMul, i)
+                            _tpd = _stp * array.get(slRR, i)
+                            _slP = _lg ? close - _stp : close + _stp
+                            _tpP = _lg ? close + _tpd : close - _tpd
+                            tradeNr := tradeNr + 1
+                            array.set(sSig, i, 1)
+                            array.set(cN, i, array.get(cN, i) + 1)
+
+                            _l1 = toonLijn ? line.new(bar_index, _slP, bar_index + lijnBars, _slP,
+                                 color = color.new(color.red, 10), width = 2) : na
+                            _l2 = toonLijn ? line.new(bar_index, _tpP, bar_index + lijnBars, _tpP,
+                                 color = color.new(color.green, 10), width = 2) : na
+                            if toonLijn
+                                label.new(bar_index + lijnBars, _slP, "SL " + str.tostring(math.round(_slP, dec)),
+                                     style = label.style_none, textcolor = color.new(color.red, 15), size = size.tiny)
+                                label.new(bar_index + lijnBars, _tpP, "TP " + str.tostring(math.round(_tpP, dec)),
+                                     style = label.style_none, textcolor = color.new(color.green, 15), size = size.tiny)
+
+                            _tip = "Slot " + str.tostring(i + 1) + (_lg ? "  BUY" : "  SELL") +
+                                 "\nstart " + str.format("{0,number,00}:{1,number,00}",
+                                      array.get(slH, i), array.get(slM, i)) +
+                                 "   ORB " + str.tostring(array.get(slOrb, i)) + "m" +
+                                 "   venster " + str.tostring(_win) + "m" +
+                                 "\nentry " + str.tostring(math.round(close, dec)) +
+                                 "\nSL " + str.tostring(math.round(_slP, dec)) +
+                                 "  (×" + str.tostring(array.get(slMul, i), "#.#") + ")" +
+                                 "\nTP " + str.tostring(math.round(_tpP, dec)) +
+                                 "  (" + str.tostring(array.get(slRR, i), "#.#") + "R)" +
+                                 "\nVWAP " + _vs
+                            _lb = toonLbl ? label.new(bar_index, _lg ? low : high,
+                                 labelVol ? "S" + str.tostring(i + 1) + (_lg ? " ▲ BUY" : " ▼ SELL") : "",
+                                 style = labelVol ? (_lg ? label.style_label_up : label.style_label_down)
+                                                  : (_lg ? label.style_triangleup : label.style_triangledown),
+                                 color = _lg ? color.new(color.green, 10) : color.new(color.red, 10),
+                                 textcolor = color.white, size = size.tiny, tooltip = _tip) : na
+
+                            array.push(pos, Pos.new(close, _stp, _tpd, _lg ? 1 : 0, i,
+                                 time + houdMin * 60000, _l1, _l2))
+
+                            _id = sym + "-" +
+                                 str.format("{0,number,00}{1,number,00}", array.get(slH, i), array.get(slM, i)) + "-" +
+                                 str.tostring(array.get(slOrb, i)) + "m-x" +
+                                 str.tostring(array.get(slMul, i), "#.#") + "-" +
+                                 str.lower(_vs) + "-" + str.tostring(array.get(slRR, i), "#.#") + "R"
+
+                            array.push(orders,
+                                 '{"action":"'      + (_lg ? "buy" : "sell")                       + '"' +
+                                  ',"symbol":"'     + sym                                          + '"' +
+                                  ',"slot_id":"'    + _id                                          + '"' +
+                                  ',"slot":'        + str.tostring(i + 1)                                +
+                                  ',"trade_no":'    + str.tostring(tradeNr)                              +
+                                  ',"entry":'       + str.tostring(math.round(close, dec))                +
+                                  ',"sl":'          + str.tostring(math.round(_slP, dec))                 +
+                                  ',"sl_points":'   + str.tostring(math.round(_stp, dec))                 +
+                                  ',"tp":'          + str.tostring(math.round(_tpP, dec))                 +
+                                  ',"tp_points":'   + str.tostring(math.round(_tpd, dec))                 +
+                                  ',"rr":'          + str.tostring(array.get(slRR, i), "#.#")             +
+                                  ',"sl_mult":'     + str.tostring(array.get(slMul, i), "#.#")            +
+                                  ',"orb_start":"'  + str.format("{0,number,00}:{1,number,00}",
+                                                         array.get(slH, i), array.get(slM, i))      + '"' +
+                                  ',"orb_minutes":' + str.tostring(array.get(slOrb, i))                   +
+                                  ',"venster_min":' + str.tostring(_win)                                  +
+                                  ',"orb_high":'    + str.tostring(math.round(_hi, dec))                  +
+                                  ',"orb_low":'     + str.tostring(math.round(_lo, dec))                  +
+                                  ',"vwap_side":"'  + str.lower(_vs)                               + '"' +
+                                  ',"vwap":'        + str.tostring(math.round(vw, dec))                   +
+                                  ',"risk_pct":'    + str.tostring(riskPct, "#.##")                       +
+                                  ',"expires_at":"' + str.format_time(time + houdMin * 60000,
+                                                         "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")         + '"' +
+                                  '}')
+
+if array.size(pos) > 0
+    for i = array.size(pos) - 1 to 0
+        p   = array.get(pos, i)
+        fav = p.dir == 1 ? high - p.e : p.e - low
+        adv = p.dir == 1 ? p.e - low  : high - p.e
+        _sl = adv >= p.stop
+        _tp = fav >= p.tp
+        if _sl or _tp or time >= p.dl
+            if _tp and not _sl
+                array.set(cWin, p.slot, array.get(cWin, p.slot) + 1)
+                if not na(p.lTP)
+                    line.set_color(p.lTP, color.new(color.green, 0))
+
+            // ── Rollend R bijwerken voor de monitor ───────────────────────
+            if monAan
+                _rGesloten = _sl ? -1.0 :
+                     _tp ? p.tp / p.stop :
+                     (p.dir == 1 ? (close - p.e) : (p.e - close)) / p.stop   // timeout: werkelijk R op sluitmoment
+                _s   = p.slot
+                _idx = array.get(rollPos, _s)
+                _old = matrix.get(rollBuf, _s, _idx)
+                _aft = array.get(rollSum, _s) + _rGesloten - (na(_old) ? 0.0 : _old)
+                array.set(rollSum, _s, _aft)
+                matrix.set(rollBuf, _s, _idx, _rGesloten)
+                array.set(rollPos, _s, (_idx + 1) % rollN)
+                _cnt = array.get(rollCnt, _s)
+                if _cnt < rollN
+                    array.set(rollCnt, _s, _cnt + 1)
+                    _cnt := _cnt + 1
+                _avg = _cnt > 0 ? _aft / _cnt : na
+                array.set(slAvgR, _s, _avg)
+                _base = array.get(slBaseEV, _s)
+                _stat = _cnt < minTr ? 0 :
+                     _avg < 0 ? 3 :
+                     (not na(_base) and _avg < _base - warnMarg) ? 2 : 1
+                array.set(slStat, _s, _stat)
+
+            // ── P&L-rapport: SL = -verlies, TP = +verlies × RR, timeout = werkelijk R × verlies ──
+            _kP  = _sl ? 2 : _tp ? 1 : 3
+            _rP  = _sl ? -1.0 : _tp ? array.get(slRR, p.slot) :
+                 (p.dir == 1 ? (close - p.e) : (p.e - close)) / p.stop
+            _plP = _rP * verliesEur
+            addAgg(aD, dIdx, _kP, _plP)
+            addAgg(aW, wkKey, _kP, _plP)
+            addAgg(aM, moKey, _kP, _plP)
+            if array.get(wdLast, wdIdx) != dIdx
+                array.set(wdLast, wdIdx, dIdx)
+                array.set(wdDays, wdIdx, array.get(wdDays, wdIdx) + 1)
+            array.set(wdN, wdIdx, array.get(wdN, wdIdx) + 1)
+            array.set(wdW, wdIdx, array.get(wdW, wdIdx) + (_kP == 1 ? 1 : 0))
+            array.set(wdL, wdIdx, array.get(wdL, wdIdx) + (_kP == 2 ? 1 : 0))
+            array.set(wdT, wdIdx, array.get(wdT, wdIdx) + (_kP == 3 ? 1 : 0))
+            array.set(wdP, wdIdx, array.get(wdP, wdIdx) + _plP)
+
+            array.remove(pos, i)
+
+if alertsAan and mag and array.size(orders) > 0
+    alert('{"orders":[' + array.join(orders, ",") + ']}', alert.freq_once_per_bar_close)
+
+var bool _flaggedAny = false
+
+if barstate.islast and toonTab
+    var table t = table.new(position.bottom_right, 12, N + 3, border_width = 1,
+         frame_color = color.new(color.gray, 40), frame_width = 1)
+    table.clear(t, 0, 0, 11, N + 2)
+    hh = color.new(color.teal, 10)
+    kk = array.from("slot", "start", "ORB", "venster", "SL×", "VWAP", "RR", "n", "TP", "WR", "live R", "status")
+    for c = 0 to 11
+        table.cell(t, c, 0, array.get(kk, c), text_color = color.white, bgcolor = hh, text_size = size.tiny)
+    _r = 1
+    _flaggedAny := false
+    for i = 0 to N - 1
+        _aan = array.get(slAct, i)
+        if _aan or toonGeblok
+            _tc = _aan ? color.white : color.new(color.gray, 55)
+            _n  = array.get(cN, i)
+            _w  = array.get(cWin, i)
+            table.cell(t, 0, _r, "S" + str.tostring(i + 1) + (_aan ? "" : " ✕"), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 1, _r, str.format("{0,number,00}:{1,number,00}",
+                 array.get(slH, i), array.get(slM, i)), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 2, _r, str.tostring(array.get(slOrb, i)) + "m", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 3, _r, str.tostring(array.get(slWin, i)) + "m", text_color = color.new(color.aqua, 0), text_size = size.tiny)
+            table.cell(t, 4, _r, "×" + str.tostring(array.get(slMul, i), "#.#"), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 5, _r, array.get(slVw, i), text_color = _tc, text_size = size.tiny)
+            table.cell(t, 6, _r, str.tostring(array.get(slRR, i), "#.#") + "R", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 7, _r, _aan ? str.tostring(_n) : "—", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 8, _r, _aan ? str.tostring(_w) : "—", text_color = _tc, text_size = size.tiny)
+            table.cell(t, 9, _r, _aan and _n > 0 ? str.tostring(_w / _n * 100, "#") + "%" : "—",
+                 text_color = _tc, text_size = size.tiny)
+
+            // ── Monitorkolommen ────────────────────────────────────────────
+            if _aan and monAan
+                _avg  = array.get(slAvgR, i)
+                _stat = array.get(slStat, i)
+                table.cell(t, 10, _r, na(_avg) ? "…" : str.tostring(_avg, "#.##"),
+                     text_color = _tc, text_size = size.tiny)
+                _stTxt   = _stat == 0 ? "…" : _stat == 1 ? "OK" : _stat == 2 ? "zwak" : "LOSS"
+                _stColor = _stat == 0 ? color.new(color.gray, 40) :
+                     _stat == 1 ? color.new(color.green, 0) :
+                     _stat == 2 ? color.new(color.orange, 0) : color.new(color.red, 0)
+                table.cell(t, 11, _r, _stTxt, text_color = color.white, bgcolor = _stColor, text_size = size.tiny)
+                if _stat >= 2
+                    _flaggedAny := true
+            else
+                table.cell(t, 10, _r, "—", text_color = _tc, text_size = size.tiny)
+                table.cell(t, 11, _r, "—", text_color = _tc, text_size = size.tiny)
+            _r := _r + 1
+
+    table.cell(t, 0, _r, syminfo.ticker, text_color = color.new(color.aqua, 0), text_size = size.tiny)
+    table.cell(t, 1, _r, mag ? "preset " + effPreset : "GEEN PRESET",
+         text_color = mag ? color.orange : color.red, text_size = size.tiny)
+    table.cell(t, 3, _r, mag ? "" : "stil — symbool niet in de geverifieerde slots",
+         text_color = color.red, text_size = size.tiny)
+
+// ── P&L-rapport (tabellen) ──────────────────────────────────────────────────
+if barstate.islast and pnlAan and mag
+    var table tr = table.new(posOf(posRap), 8, rapRij + 12, border_width = 1,
+         frame_color = color.new(color.gray, 40), frame_width = 1)
+    var table tw = table.new(posOf(posWd), 9, 10, border_width = 1,
+         frame_color = color.new(color.gray, 40), frame_width = 1)
+    table.clear(tr, 0, 0, 7, rapRij + 11)
+    table.clear(tw, 0, 0, 8, 9)
+    hh2 = color.new(color.teal, 10)
+
+    // Totalen over alle dagen
+    _tn = 0
+    _tw = 0
+    _tl = 0
+    _tt = 0
+    _tp = 0.0
+    for q = 0 to aD.k.size() - 1
+        _tn += aD.n.get(q)
+        _tw += aD.w.get(q)
+        _tl += aD.l.get(q)
+        _tt += aD.t.get(q)
+        _tp += aD.pnl.get(q)
+    _nD = aD.k.size(), _nW = aW.k.size(), _nM = aM.k.size()
+
+    hk = array.from("periode", "trades", "W", "L", "TO", "hit%", "net €", "Ø/trade")
+    for c = 0 to 7
+        table.cell(tr, c, 0, array.get(hk, c), text_color = color.white, bgcolor = hh2, text_size = size.tiny)
+    putAgg(tr, 1, "Vandaag", aD, lastIdx(aD, dIdx))
+    putAgg(tr, 2, "Deze week", aW, lastIdx(aW, wkKey))
+    putAgg(tr, 3, "Deze maand", aM, lastIdx(aM, moKey))
+    putRow(tr, 4, "Totaal", _tn, _tw, _tl, _tt, _tp)
+
+    // Gemiddelden en uitschieters (alleen periodes mét trades)
+    table.cell(tr, 0, 5, "Ø per dag (" + str.tostring(_nD) + ")", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tr, 0, 6, "Ø per week (" + str.tostring(_nW) + ")", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tr, 0, 7, "Ø per maand (" + str.tostring(_nM) + ")", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tr, 0, 8, "Beste dag", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tr, 0, 9, "Slechtste dag", text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    _aDay = _nD > 0 ? _tp / _nD : 0.0
+    _aWk  = _nW > 0 ? _tp / _nW : 0.0
+    _aMo  = _nM > 0 ? _tp / _nM : 0.0
+    table.cell(tr, 6, 5, fmtE(_aDay), text_color = colE(_aDay), text_size = size.tiny)
+    table.cell(tr, 6, 6, fmtE(_aWk),  text_color = colE(_aWk),  text_size = size.tiny)
+    table.cell(tr, 6, 7, fmtE(_aMo),  text_color = colE(_aMo),  text_size = size.tiny)
+    if _nD > 0
+        _mx = array.max(aD.pnl), _mn = array.min(aD.pnl)
+        table.cell(tr, 1, 8, dagLbl(aD.k.get(array.indexof(aD.pnl, _mx))), text_color = color.white, text_size = size.tiny)
+        table.cell(tr, 6, 8, fmtE(_mx), text_color = colE(_mx), text_size = size.tiny)
+        table.cell(tr, 1, 9, dagLbl(aD.k.get(array.indexof(aD.pnl, _mn))), text_color = color.white, text_size = size.tiny)
+        table.cell(tr, 6, 9, fmtE(_mn), text_color = colE(_mn), text_size = size.tiny)
+
+    // Lijst van de laatste N periodes (nieuwste bovenaan)
+    table.cell(tr, 0, 10, "Laatste " + str.tostring(rapRij) + " " + (rapPer == "Dag" ? "dagen" : rapPer == "Week" ? "weken" : "maanden"),
+         text_color = color.new(color.aqua, 0), text_size = size.tiny, text_halign = text.align_left)
+    Agg _lst = rapPer == "Dag" ? aD : rapPer == "Week" ? aW : aM
+    for r = 0 to rapRij - 1
+        _ix = _lst.k.size() - 1 - r
+        if _ix >= 0
+            _kk = _lst.k.get(_ix)
+            _lb = rapPer == "Dag" ? dagLbl(_kk) : rapPer == "Week" ? wekLbl(_kk) : maaLbl(_kk)
+            putAgg(tr, 11 + r, _lb, _lst, _ix)
+
+    // Per weekdag
+    wk2 = array.from("dag", "dagen", "trades", "W", "L", "hit%", "net €", "Ø/dag", "Ø/trade")
+    for c = 0 to 8
+        table.cell(tw, c, 0, array.get(wk2, c), text_color = color.white, bgcolor = hh2, text_size = size.tiny)
+    wdNm = array.from("Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag")
+    _rw = 1
+    for d = 0 to 6
+        _nd = array.get(wdN, d)
+        if d < 5 or _nd > 0
+            _dg = array.get(wdDays, d), _pp = array.get(wdP, d)
+            table.cell(tw, 0, _rw, array.get(wdNm, d), text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+            table.cell(tw, 1, _rw, str.tostring(_dg), text_color = color.white, text_size = size.tiny)
+            table.cell(tw, 2, _rw, str.tostring(_nd), text_color = color.white, text_size = size.tiny)
+            table.cell(tw, 3, _rw, str.tostring(array.get(wdW, d)), text_color = color.new(color.lime, 0), text_size = size.tiny)
+            table.cell(tw, 4, _rw, str.tostring(array.get(wdL, d)), text_color = color.new(color.red, 0), text_size = size.tiny)
+            table.cell(tw, 5, _rw, fmtHit(array.get(wdW, d), array.get(wdL, d)), text_color = color.white, text_size = size.tiny)
+            table.cell(tw, 6, _rw, fmtE(_pp), text_color = colE(_pp), text_size = size.tiny)
+            table.cell(tw, 7, _rw, _dg > 0 ? fmtE(_pp / _dg) : "—", text_color = colE(_pp), text_size = size.tiny)
+            table.cell(tw, 8, _rw, _nd > 0 ? fmtE(_pp / _nd) : "—", text_color = colE(_pp), text_size = size.tiny)
+            _rw += 1
+    _dgT = _nD
+    table.cell(tw, 0, _rw, "Totaal", text_color = color.new(color.aqua, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tw, 1, _rw, str.tostring(_dgT), text_color = color.white, text_size = size.tiny)
+    table.cell(tw, 2, _rw, str.tostring(_tn), text_color = color.white, text_size = size.tiny)
+    table.cell(tw, 3, _rw, str.tostring(_tw), text_color = color.new(color.lime, 0), text_size = size.tiny)
+    table.cell(tw, 4, _rw, str.tostring(_tl), text_color = color.new(color.red, 0), text_size = size.tiny)
+    table.cell(tw, 5, _rw, fmtHit(_tw, _tl), text_color = color.white, text_size = size.tiny)
+    table.cell(tw, 6, _rw, fmtE(_tp), text_color = colE(_tp), text_size = size.tiny)
+    table.cell(tw, 7, _rw, _dgT > 0 ? fmtE(_tp / _dgT) : "—", text_color = colE(_tp), text_size = size.tiny)
+    table.cell(tw, 8, _rw, _tn > 0 ? fmtE(_tp / _tn) : "—", text_color = colE(_tp), text_size = size.tiny)
+
+// Losse, optionele alert — NIET hetzelfde kanaal als de order-webhook hierboven.
+// Stel dit apart in via TradingView's "Alert instellen" als je een melding wilt
+// zodra een slot naar "zwak" of "LOSS" kantelt.
+alertcondition(monAan and _flaggedAny, title = "PRONTO ORB · degradatie",
+     message = "Een of meer slots staan op zwak/LOSS in de monitor-tabel — controleer en overweeg een rescan.")
+
+_vwKleur = close >= vw ? color.new(color.aqua, 0) : color.new(color.fuchsia, 0)
+plot(toonVwap ? vw : na, "VWAP", color = _vwKleur, linewidth = 2)
