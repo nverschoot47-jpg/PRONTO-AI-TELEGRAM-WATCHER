@@ -3,8 +3,12 @@
 // PRONTO-AI — Telegram Alert Watcher (standalone Railway service)
 //
 // Polls /api/open-positions of each account every few seconds and
-// sends a Telegram alert when a NEW positionId shows up, when a
-// position disappears (closed), and when an account goes down / recovers.
+// sends a Telegram alert when:
+//   - a NEW positionId shows up (trade taken)
+//   - a position disappears (trade closed) -> with WIN / LOSS result
+//
+// Unreachable / reachable-again events are only logged in Railway,
+// they are NOT sent to Telegram.
 //
 // Env vars (set in Railway, NEVER in this file):
 //   TELEGRAM_BOT_TOKEN   bot token from @BotFather
@@ -13,7 +17,8 @@
 //   POLL_INTERVAL_MS     optional, default 10000
 //   REQUEST_TIMEOUT_MS   optional, default 8000
 //   NOTIFY_CLOSED        optional, "false" to disable closed-trade alerts
-//   DOWN_AFTER_FAILS     optional, default 3 consecutive failures before alert
+//   DOWN_AFTER_FAILS     optional, default 3 consecutive failures before
+//                        an account is marked down (log only)
 // ================================================================
 
 const https = require("https");
@@ -140,8 +145,10 @@ async function notify(text, logCtx) {
 }
 
 // ── Message formatting ──────────────────────────────────────────────
+const fmt = (n, d = 2) => (n == null || isNaN(Number(n)) ? "--" : Number(n).toFixed(d));
+const num = (v) => (v == null || v === "" || isNaN(Number(v)) ? NaN : Number(v));
+
 function formatAlert(label, pos) {
-  const fmt = (n, d = 2) => (n == null || isNaN(Number(n)) ? "--" : Number(n).toFixed(d));
   const priceDp = pos.assetType === "index" ? 2 : 4;
   const dirIcon = pos.direction === "buy" ? "🟢 BUY" : "🔴 SELL";
   return [
@@ -158,15 +165,41 @@ function formatAlert(label, pos) {
   ].join("\n");
 }
 
+// Determines win/loss from the last seen position data
+function resolveResult(pos) {
+  // 1) A profit/loss field is the most reliable
+  const pnl = [pos.profit, pos.pnl, pos.unrealizedPnl, pos.unrealizedProfit, pos.floatingPnl, pos.pnlEur]
+    .map(num).find((n) => !isNaN(n));
+  if (pnl !== undefined) {
+    if (pnl > 0) return { icon: "✅", text: "WIN", pnl };
+    if (pnl < 0) return { icon: "❌", text: "LOSS", pnl };
+    return { icon: "⚪", text: "BREAKEVEN", pnl };
+  }
+  // 2) Otherwise compare last known price with entry
+  const price = [pos.currentPrice, pos.price, pos.lastPrice, pos.markPrice].map(num).find((n) => !isNaN(n));
+  const entry = num(pos.entry);
+  if (price !== undefined && !isNaN(entry)) {
+    const diff = (price - entry) * (pos.direction === "buy" ? 1 : -1);
+    if (diff > 0) return { icon: "✅", text: "WIN" };
+    if (diff < 0) return { icon: "❌", text: "LOSS" };
+    return { icon: "⚪", text: "BREAKEVEN" };
+  }
+  return { icon: "❔", text: "RESULT UNKNOWN" };
+}
+
 function formatClosed(label, pos) {
-  const fmt = (n, d = 2) => (n == null || isNaN(Number(n)) ? "--" : Number(n).toFixed(d));
   const priceDp = pos.assetType === "index" ? 2 : 4;
   const dir = pos.direction === "buy" ? "BUY" : "SELL";
-  return [
-    `⚪ <b>[${esc(label)}] ${esc(pos.symbol)} ${dir} closed</b>`,
-    `Entry was ${fmt(pos.entry, priceDp)}  |  SL ${fmt(pos.sl, priceDp)}  |  TP ${fmt(pos.tp, priceDp)}`,
-    `ID: ${esc(pos.positionId)}`,
-  ].join("\n");
+  const r = resolveResult(pos);
+  const lines = [
+    `${r.icon} <b>[${esc(label)}] ${esc(pos.symbol)} ${dir} closed — ${r.text}</b>`,
+  ];
+  if (r.pnl !== undefined) lines.push(`P/L: <b>${r.pnl > 0 ? "+" : ""}${fmt(r.pnl)}</b>`);
+  lines.push(
+    `Entry ${fmt(pos.entry, priceDp)}  |  SL ${fmt(pos.sl, priceDp)}  |  TP ${fmt(pos.tp, priceDp)}`,
+    `ID: ${esc(pos.positionId)}`
+  );
+  return lines.join("\n");
 }
 
 // ── Poll one account ────────────────────────────────────────────────
@@ -185,16 +218,15 @@ async function pollAccount(account) {
       console.error(`[Watcher] ${label}: fetch failed (${st.fails}x in a row) — ${e.message}`);
     }
     if (st.fails >= DOWN_AFTER_FAILS && !st.down) {
-      st.down = true;
-      await notify(`⚠️ <b>[${esc(label)}] unreachable</b>\n${esc(e.message)}\nNo alerts for this account until it recovers.`, label);
+      st.down = true; // log only, no Telegram message
+      console.error(`[Watcher] ${label}: marked DOWN`);
     }
     return;
   }
 
   if (st.down) {
-    st.down = false;
+    st.down = false; // log only, no Telegram message
     console.log(`[Watcher] ${label}: recovered`);
-    await notify(`✅ <b>[${esc(label)}] reachable again</b>`, label);
   }
   st.fails = 0;
 
